@@ -27,7 +27,7 @@ async function run() {
     const directRate = await fetcher.fetchRate();
     assert.equal(directRate.currency, 'GHS');
     assert.equal(directRate.rate, 2.45);
-    assert.equal(directRate.source, 'CoinGecko');
+    assert.equal(directRate.source, 'Weighted average of 1 sources (outliers filtered)');
 
     let exchangeRateRequested = false;
 
@@ -103,3 +103,4 @@ run().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
+

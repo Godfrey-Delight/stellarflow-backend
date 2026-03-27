@@ -1,18 +1,20 @@
 import axios from 'axios';
 import { validatePrice } from './validation';
 export class GHSRateFetcher {
-    coinGeckoUrl = 'https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=ghs,usd&include_last_updated_at=true';
-    usdToGhsUrl = 'https://open.er-api.com/v6/latest/USD';
+    coinGeckoUrl = "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=ghs,usd&include_last_updated_at=true";
+    usdToGhsUrl = "https://open.er-api.com/v6/latest/USD";
     getCurrency() {
-        return 'GHS';
+        return "GHS";
     }
     async fetchRate() {
+        const prices = [];
+        // Strategy 1: Try CoinGecko direct GHS price
         try {
             const coinGeckoResponse = await axios.get(this.coinGeckoUrl, {
                 timeout: 10000,
                 headers: {
-                    'User-Agent': 'StellarFlow-Oracle/1.0'
-                }
+                    "User-Agent": "StellarFlow-Oracle/1.0",
+                },
             });
             const stellarPrice = coinGeckoResponse.data.stellar;
             if (!stellarPrice) {
@@ -36,8 +38,51 @@ export class GHSRateFetcher {
             const exchangeRateResponse = await axios.get(this.usdToGhsUrl, {
                 timeout: 10000,
                 headers: {
-                    'User-Agent': 'StellarFlow-Oracle/1.0'
+                    "User-Agent": "StellarFlow-Oracle/1.0",
+                },
+            });
+            const stellarPrice = coinGeckoResponse.data.stellar;
+            if (stellarPrice &&
+                typeof stellarPrice.usd === "number" &&
+                stellarPrice.usd > 0) {
+                const exchangeRateResponse = await axios.get(this.usdToGhsUrl, {
+                    timeout: 10000,
+                    headers: {
+                        "User-Agent": "StellarFlow-Oracle/1.0",
+                    },
+                });
+                const usdToGhsRate = exchangeRateResponse.data.rates?.GHS;
+                if (exchangeRateResponse.data.result === "success" &&
+                    typeof usdToGhsRate === "number" &&
+                    usdToGhsRate > 0) {
+                    const fxTimestamp = exchangeRateResponse.data.time_last_update_unix
+                        ? new Date(exchangeRateResponse.data.time_last_update_unix * 1000)
+                        : new Date();
+                    const lastUpdatedAt = stellarPrice.last_updated_at
+                        ? new Date(stellarPrice.last_updated_at * 1000)
+                        : new Date();
+                    prices.push({
+                        rate: stellarPrice.usd * usdToGhsRate,
+                        timestamp: fxTimestamp > lastUpdatedAt ? fxTimestamp : lastUpdatedAt,
+                        source: "CoinGecko + ExchangeRate API",
+                        trustLevel: "trusted",
+                    });
+                    // Success - reset error tracker
+                    errorTracker.trackSuccess("GHS-price-fetch");
                 }
+            }
+        }
+        catch (error) {
+            console.debug("CoinGecko + ExchangeRate API failed");
+        }
+        // Strategy 3: Try alternative XLM pricing source
+        try {
+            const alternativeUrl = "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd";
+            const altResponse = await axios.get(alternativeUrl, {
+                timeout: 10000,
+                headers: {
+                    "User-Agent": "StellarFlow-Oracle/1.0",
+                },
             });
             const usdToGhsRate = exchangeRateResponse.data.rates?.GHS;
             if (exchangeRateResponse.data.result !== 'success' || typeof usdToGhsRate !== 'number') {
@@ -54,9 +99,24 @@ export class GHSRateFetcher {
                 source: 'CoinGecko + ExchangeRate API'
             };
         }
-        catch (error) {
-            throw new Error(`Failed to fetch GHS rate: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        // All strategies failed - track failure and send notification if 3 consecutive failures
+        const error = new Error("All GHS rate sources failed");
+        const thresholdReached = errorTracker.trackFailure("GHS-price-fetch", {
+            errorMessage: error.message,
+            timestamp: new Date(),
+            service: "GHSRateFetcher",
+        });
+        if (thresholdReached) {
+            await webhookService.sendErrorNotification({
+                errorType: "PRICE_FETCH_FAILED_CONSECUTIVE",
+                errorMessage: error.message,
+                attempts: 3,
+                service: "GHSRateFetcher",
+                pricePair: "XLM/GHS",
+                timestamp: new Date(),
+            });
         }
+        throw error;
     }
     async isHealthy() {
         try {

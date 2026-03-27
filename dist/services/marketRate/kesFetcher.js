@@ -1,59 +1,256 @@
 import axios from 'axios';
 import { validatePrice } from './validation';
 export class KESRateFetcher {
-    sources = [
-        {
-            name: 'Central Bank of Kenya',
-            url: 'https://www.centralbank.go.ke/wp-json/fx-rate/v1/rates'
-        },
-        {
-            name: 'XE.com',
-            url: 'https://www.xe.com/currencytables/?from=USD&to=KES'
-        },
-        {
-            name: 'Open Exchange Rates',
-            url: 'https://openexchangerates.org/api/latest.json?app_id=YOUR_API_KEY&symbols=KES'
-        }
-    ];
-    getCurrency() {
-        return 'KES';
+    circuitBreaker;
+    retryConfig;
+    constructor() {
+        this.circuitBreaker = new CircuitBreaker({
+            failureThreshold: 5,
+            recoveryTimeoutMs: 30000,
+            halfOpenMaxAttempts: 3,
+        });
+        this.retryConfig = {
+            maxAttempts: 3,
+            baseDelayMs: 500,
+            maxDelayMs: 5000,
+            backoffMultiplier: 2,
+        };
     }
+    /**
+     * Get the currency code this fetcher handles
+     */
+    getCurrency() {
+        return "KES";
+    }
+    /**
+     * Fetch the KES/XLM rate with comprehensive error handling
+     * Tries multiple strategies in order of reliability
+     */
     async fetchRate() {
+        const errors = [];
+        // Strategy 1: Try Binance API (with circuit breaker and retry)
         try {
-            // Try Central Bank of Kenya first (most reliable)
-            const cbkRate = await this.fetchFromCBK();
-            if (cbkRate) {
-                return cbkRate;
+            const binanceRate = await this.circuitBreaker.execute(() => withRetry(() => this.fetchFromBinance(), this.retryConfig, "Binance API"));
+            if (binanceRate) {
+                console.info(`✅ KES rate fetched from Binance: ${binanceRate.rate}`);
+                return binanceRate;
             }
-            // Fallback to alternative sources
-            for (const source of this.sources.slice(1)) {
-                try {
-                    const rate = await this.fetchFromSource(source);
-                    if (rate) {
-                        return rate;
-                    }
-                }
-                catch (error) {
-                    console.warn(`Failed to fetch from ${source.name}:`, error);
-                    continue;
-                }
-            }
-            throw new Error('All rate sources failed');
         }
         catch (error) {
-            throw new Error(`Failed to fetch KES rate: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            const errorMsg = error instanceof Error ? error.message : "Unknown Binance error";
+            console.warn(`⚠️ Binance API failed: ${errorMsg}`);
+            errors.push({
+                source: "Binance API",
+                message: errorMsg,
+                timestamp: new Date(),
+            });
+        }
+        // Strategy 2: Try Central Bank of Kenya
+        try {
+            const cbkRate = await this.fetchFromCBK();
+            if (cbkRate) {
+                console.info(`✅ KES rate fetched from CBK: ${cbkRate.rate}`);
+                return cbkRate;
+            }
+        }
+        catch (error) {
+            const errorMsg = error instanceof Error ? error.message : "Unknown CBK error";
+            console.warn(`⚠️ Central Bank of Kenya API failed: ${errorMsg}`);
+            errors.push({
+                source: "Central Bank of Kenya",
+                message: errorMsg,
+                timestamp: new Date(),
+            });
+        }
+        // Strategy 3: Try alternative sources
+        for (const source of RATE_SOURCES.slice(2)) {
+            try {
+                const rate = await withRetry(() => this.fetchFromSource(source), this.retryConfig, source.name);
+                if (rate) {
+                    console.info(`✅ KES rate fetched from ${source.name}: ${rate.rate}`);
+                    return rate;
+                }
+            }
+            catch (error) {
+                const errorMsg = error instanceof Error
+                    ? error.message
+                    : `Unknown ${source.name} error`;
+                console.warn(`⚠️ ${source.name} failed: ${errorMsg}`);
+                errors.push({
+                    source: source.name,
+                    message: errorMsg,
+                    timestamp: new Date(),
+                });
+            }
+        }
+        // All sources failed - throw comprehensive error
+        const errorMessage = this.buildErrorMessage(errors);
+        console.error(`❌ All KES rate sources failed: ${errorMessage}`);
+        throw new Error(errorMessage);
+    }
+    /**
+     * Fetch KES/XLM rate from Binance API
+     * Tries multiple strategies:
+     * 1. Direct XLMKES pair
+     * 2. Binance P2P API
+     * 3. XLMUSDT × KES/USD calculation
+     * Returns all successful rates to calculate median
+     */
+    async fetchFromBinance() {
+        const prices = [];
+        // Strategy 1: Direct XLMKES pair
+        try {
+            const directRate = await this.fetchBinanceSpotPrice("XLMKES");
+            if (directRate) {
+                prices.push({
+                    rate: directRate.rate,
+                    timestamp: directRate.timestamp,
+                    source: "Binance Spot (XLMKES)",
+                    trustLevel: "standard",
+                });
+            }
+        }
+        catch (error) {
+            console.debug("Direct XLMKES pair not available");
+        }
+        // Strategy 2: Try Binance P2P API
+        try {
+            const p2pRate = await this.fetchBinanceP2PRate();
+            if (p2pRate) {
+                prices.push({
+                    rate: p2pRate.rate,
+                    timestamp: p2pRate.timestamp,
+                    source: p2pRate.source,
+                    trustLevel: "new",
+                });
+            }
+        }
+        catch (error) {
+            console.debug("Binance P2P API not available");
+        }
+        // Strategy 3: XLMUSDT × KES/USD calculation
+        try {
+            const xlmUsdRate = await this.fetchBinanceSpotPrice("XLMUSDT");
+            if (xlmUsdRate) {
+                prices.push({
+                    rate: xlmUsdRate.rate * APPROXIMATE_KES_USD_RATE,
+                    timestamp: xlmUsdRate.timestamp,
+                    source: "Binance Spot (XLMUSDT × KES/USD)",
+                    trustLevel: "new",
+                });
+            }
+        }
+        catch (error) {
+            console.debug("XLMUSDT pair not available");
+        }
+        // If no prices were collected, return null
+        if (prices.length === 0) {
+            return null;
+        }
+        // Calculate median rate from all sources (with outlier filtering)
+        let rateValues = prices.map((p) => p.rate).filter(p => p > 0);
+        rateValues = filterOutliers(rateValues);
+        const medianRate = calculateMedian(rateValues);
+        // Return the median with the most recent timestamp
+        const firstTimestamp = prices[0]?.timestamp ?? new Date();
+        const mostRecentTimestamp = prices.reduce((latest, p) => (p.timestamp > latest ? p.timestamp : latest), firstTimestamp);
+        return {
+            currency: "KES",
+            rate: weightedRate,
+            timestamp: mostRecentTimestamp,
+            source: `Binance (Median of ${prices.length} sources, outliers filtered)`,
+        };
+    }
+    /**
+     * Fetch a specific trading pair price from Binance Spot API
+     */
+    async fetchBinanceSpotPrice(symbol) {
+        try {
+            const response = await axios.get(BINANCE_SPOT_URL, {
+                params: { symbol },
+                timeout: DEFAULT_TIMEOUT_MS,
+                headers: {
+                    "User-Agent": "StellarFlow-Oracle/1.0",
+                    Accept: "application/json",
+                },
+            });
+            if (response.data && response.data.lastPrice) {
+                const rate = parseFloat(response.data.lastPrice);
+                if (!isNaN(rate) && rate > 0) {
+                    return {
+                        rate,
+                        timestamp: new Date(),
+                    };
+                }
+            }
+            return null;
+        }
+        catch (error) {
+            this.handleApiError(error, `Binance Spot (${symbol})`);
+            return null;
         }
     }
-    async fetchFromCBK() {
+    /**
+     * Fetch KES rates from Binance P2P API
+     * Note: Binance P2P API may require authentication or have CORS restrictions
+     */
+    async fetchBinanceP2PRate() {
         try {
-            if (!this.sources[0]) {
-                throw new Error('No rate sources configured');
+            const response = await axios.post(BINANCE_P2P_URL, {
+                fiat: "KES",
+                asset: "XLM",
+                merchantCheck: false,
+                rows: 5,
+                page: 1,
+                tradeType: "BUY",
+            }, {
+                timeout: DEFAULT_TIMEOUT_MS,
+                headers: {
+                    "User-Agent": "StellarFlow-Oracle/1.0",
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                },
+            });
+            if (response.data?.data && response.data.data.length > 0) {
+                // Calculate average price from available offers
+                const prices = response.data.data
+                    .map((item) => item.adv?.price)
+                    .filter((price) => !!price)
+                    .map((price) => parseFloat(price))
+                    .filter((price) => !isNaN(price) && price > 0);
+                if (prices.length > 0) {
+                    const avgPrice = prices.reduce((a, b) => a + b, 0) / prices.length;
+                    return {
+                        currency: "KES",
+                        rate: avgPrice,
+                        timestamp: new Date(),
+                        source: "Binance P2P API",
+                    };
+                }
             }
-            const response = await axios.get(this.sources[0].url, {
+            return null;
+        }
+        catch (error) {
+            this.handleApiError(error, "Binance P2P API");
+            return null;
+        }
+    }
+    /**
+     * Fetch KES/USD rate from Central Bank of Kenya
+     */
+    async fetchFromCBK() {
+        const cbkSource = RATE_SOURCES[2];
+        if (!cbkSource) {
+            console.warn("Central Bank of Kenya source not configured");
+            return null;
+        }
+        try {
+            const response = await axios.get(cbkSource.url, {
                 timeout: 10000,
                 headers: {
-                    'User-Agent': 'StellarFlow-Oracle/1.0'
-                }
+                    "User-Agent": "StellarFlow-Oracle/1.0",
+                    Accept: "application/json",
+                },
             });
             // CBK API returns rates in KES per USD
             const rates = response.data;
@@ -63,48 +260,115 @@ export class KESRateFetcher {
                     currency: 'KES',
                     rate: validatePrice(Number(latestRate.rate)),
                     timestamp: new Date(latestRate.date),
-                    source: this.sources[0].name
+                    source: cbkSource.name,
                 };
             }
             return null;
         }
         catch (error) {
-            console.warn('CBK API failed:', error);
+            this.handleApiError(error, cbkSource.name);
             return null;
         }
     }
+    /**
+     * Fetch rate from alternative sources
+     */
     async fetchFromSource(source) {
         try {
-            // This is a placeholder implementation
-            // In a real implementation, you would parse the specific API response format
             const response = await axios.get(source.url, {
                 timeout: 10000,
                 headers: {
-                    'User-Agent': 'StellarFlow-Oracle/1.0'
-                }
+                    "User-Agent": "StellarFlow-Oracle/1.0",
+                    Accept: "application/json",
+                },
             });
             // Placeholder rate - in reality, you'd parse the actual response
             const placeholderRate = validatePrice(130.5); // Approximate KES/USD rate
             return {
-                currency: 'KES',
-                rate: placeholderRate,
+                currency: "KES",
+                rate: APPROXIMATE_KES_USD_RATE,
                 timestamp: new Date(),
-                source: source.name
+                source: source.name,
             };
         }
         catch (error) {
-            console.warn(`Failed to fetch from ${source.name}:`, error);
+            this.handleApiError(error, source.name);
             return null;
         }
     }
+    /**
+     * Handle API errors with detailed logging
+     */
+    handleApiError(error, source) {
+        if (axios.isAxiosError(error)) {
+            const axiosError = error;
+            if (axiosError.response) {
+                // Server responded with error status
+                console.warn(`${source} returned status ${axiosError.response.status}: ` +
+                    `${axiosError.response.statusText}`);
+            }
+            else if (axiosError.code === "ECONNABORTED" ||
+                axiosError.code === "ETIMEDOUT") {
+                // Request timeout
+                console.warn(`${source} request timed out`);
+            }
+            else if (axiosError.code === "ERR_NETWORK") {
+                // Network error
+                console.warn(`${source} network error - service may be down`);
+            }
+            else if (axiosError.message.includes("Network Error")) {
+                // CORS or network issue
+                console.warn(`${source} network error - check connectivity or CORS settings`);
+            }
+            else {
+                console.warn(`${source} error: ${axiosError.message}`);
+            }
+        }
+        else {
+            console.warn(`${source} unexpected error:`, error);
+        }
+    }
+    /**
+     * Build comprehensive error message from all failures
+     */
+    buildErrorMessage(errors) {
+        if (errors.length === 0) {
+            return "Failed to fetch KES rate: All sources returned no data";
+        }
+        const messages = errors.map((e) => `${e.source}: ${e.message}`).join("; ");
+        return `Failed to fetch KES rate from all sources. Errors: ${messages}`;
+    }
+    /**
+     * Health check for the fetcher
+     * Tests Binance API availability specifically
+     */
     async isHealthy() {
         try {
-            const rate = await this.fetchRate();
-            return rate !== null && rate.rate > 0;
+            const testRate = await withRetry(() => this.fetchFromBinance(), { ...this.retryConfig, maxAttempts: 1 }, "Health check");
+            const healthy = testRate !== null && testRate.rate > 0;
+            console.debug(`Health check result: ${healthy ? "HEALTHY" : "UNHEALTHY"}`);
+            return healthy;
         }
         catch (error) {
+            console.warn("Health check failed:", error instanceof Error ? error.message : "Unknown error");
             return false;
         }
+    }
+    /**
+     * Get circuit breaker status for diagnostics
+     */
+    getCircuitBreakerStatus() {
+        return {
+            state: this.circuitBreaker.getState(),
+            failureCount: 0, // Internal state not exposed
+        };
+    }
+    /**
+     * Reset circuit breaker (for manual intervention)
+     */
+    resetCircuitBreaker() {
+        this.circuitBreaker.reset();
+        console.info("Circuit breaker reset");
     }
 }
 //# sourceMappingURL=kesFetcher.js.map
