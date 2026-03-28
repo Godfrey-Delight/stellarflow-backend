@@ -1,4 +1,5 @@
 import axios from "axios";
+import { withRetry } from "../utils/retryUtil.js";
 
 type MarkdownText = {
   type: "mrkdwn";
@@ -99,13 +100,27 @@ export class WebhookService {
       return;
     }
 
+    const webhookUrl = this.webhookUrl;
+
     try {
-      await axios.post(this.webhookUrl, message, {
-        headers: { "Content-Type": "application/json" },
-        timeout: 5000,
-      });
+      await withRetry(
+        () =>
+          axios.post(webhookUrl, message, {
+            headers: { "Content-Type": "application/json" },
+            timeout: 5000,
+          }),
+        {
+          maxRetries: 3,
+          retryDelay: 1000,
+          onRetry: (attempt, error, delay) => {
+            console.debug(
+              `Webhook notification retry attempt ${attempt}/3 after ${delay}ms. Error: ${error.message}`,
+            );
+          },
+        },
+      );
     } catch (error) {
-      console.error("Failed to send webhook notification:", error);
+      console.error("Failed to send webhook notification after retries:", error);
     }
   }
 

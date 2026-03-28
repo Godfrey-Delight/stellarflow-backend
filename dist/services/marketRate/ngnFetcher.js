@@ -1,5 +1,6 @@
 import axios from "axios";
-import { calculateMedian } from "./types";
+import { filterOutliers, calculateWeightedAverage } from "./types";
+import { withRetry } from "../../utils/retryUtil.js";
 function parseAmount(value) {
     if (value == null)
         return null;
@@ -46,14 +47,14 @@ export class NGNRateFetcher {
         const headers = this.vtpassHeaders();
         if (!headers)
             return null;
-        const response = await axios.get(`${this.vtpassBase()}/service-variations`, {
+        const response = await withRetry(() => axios.get(`${this.vtpassBase()}/service-variations`, {
             params: { serviceID: serviceId },
             timeout: 15000,
             headers: {
                 ...headers,
                 "User-Agent": "StellarFlow-Oracle/1.0",
             },
-        });
+        }), { maxRetries: 3, retryDelay: 1000 });
         if (response.data.response_description !== "000") {
             return null;
         }
@@ -74,12 +75,12 @@ export class NGNRateFetcher {
         try {
             const vt = await this.fetchNgnPerUsdFromVtpass();
             if (vt) {
-                const coinGeckoResponse = await axios.get(this.coinGeckoUrl, {
+                const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
                     timeout: 10000,
                     headers: {
                         "User-Agent": "StellarFlow-Oracle/1.0",
                     },
-                });
+                }), { maxRetries: 3, retryDelay: 1000 });
                 const usd = coinGeckoResponse.data.stellar?.usd;
                 if (typeof usd === "number" && usd > 0) {
                     const lastUpdatedAt = coinGeckoResponse.data.stellar?.last_updated_at
@@ -90,6 +91,7 @@ export class NGNRateFetcher {
                         rate: usd * vt.ngnPerUsd,
                         timestamp: ts,
                         source: "VTpass variation + CoinGecko (XLM/USD)",
+                        trustLevel: "new",
                     });
                 }
             }
@@ -99,12 +101,12 @@ export class NGNRateFetcher {
         }
         // Strategy 2: CoinGecko direct XLM/NGN
         try {
-            const coinGeckoResponse = await axios.get(this.coinGeckoUrl, {
+            const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
                 timeout: 10000,
                 headers: {
                     "User-Agent": "StellarFlow-Oracle/1.0",
                 },
-            });
+            }), { maxRetries: 3, retryDelay: 1000 });
             const stellarPrice = coinGeckoResponse.data.stellar;
             if (stellarPrice &&
                 typeof stellarPrice.ngn === "number" &&
@@ -116,6 +118,7 @@ export class NGNRateFetcher {
                     rate: stellarPrice.ngn,
                     timestamp: lastUpdatedAt,
                     source: "CoinGecko (direct NGN)",
+                    trustLevel: "standard",
                 });
             }
         }
@@ -124,22 +127,22 @@ export class NGNRateFetcher {
         }
         // Strategy 3: CoinGecko XLM/USD × USD/NGN (open.er-api)
         try {
-            const coinGeckoResponse = await axios.get(this.coinGeckoUrl, {
+            const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
                 timeout: 10000,
                 headers: {
                     "User-Agent": "StellarFlow-Oracle/1.0",
                 },
-            });
+            }), { maxRetries: 3, retryDelay: 1000 });
             const stellarPrice = coinGeckoResponse.data.stellar;
             if (stellarPrice &&
                 typeof stellarPrice.usd === "number" &&
                 stellarPrice.usd > 0) {
-                const fxResponse = await axios.get(this.usdToNgnUrl, {
+                const fxResponse = await withRetry(() => axios.get(this.usdToNgnUrl, {
                     timeout: 10000,
                     headers: {
                         "User-Agent": "StellarFlow-Oracle/1.0",
                     },
-                });
+                }), { maxRetries: 3, retryDelay: 1000 });
                 const usdToNgn = fxResponse.data.rates?.NGN;
                 if (fxResponse.data.result === "success" &&
                     typeof usdToNgn === "number" &&
@@ -154,6 +157,7 @@ export class NGNRateFetcher {
                         rate: stellarPrice.usd * usdToNgn,
                         timestamp: fxTimestamp > lastUpdatedAt ? fxTimestamp : lastUpdatedAt,
                         source: "CoinGecko + ExchangeRate API (USD→NGN)",
+                        trustLevel: "trusted",
                     });
                 }
             }
@@ -162,14 +166,19 @@ export class NGNRateFetcher {
             console.debug("CoinGecko + ExchangeRate API (NGN) failed");
         }
         if (prices.length > 0) {
-            const rateValues = prices.map((p) => p.rate);
-            const medianRate = calculateMedian(rateValues);
+            let rateValues = prices.map((p) => p.rate).filter(p => p > 0);
+            rateValues = filterOutliers(rateValues);
             const mostRecentTimestamp = prices.reduce((latest, p) => (p.timestamp > latest ? p.timestamp : latest), prices[0]?.timestamp ?? new Date());
+            const weightedInput = prices.map((p) => ({
+                value: p.rate,
+                trustLevel: p.trustLevel,
+            }));
+            const weightedRate = calculateWeightedAverage(weightedInput);
             return {
                 currency: "NGN",
-                rate: medianRate,
+                rate: weightedRate,
                 timestamp: mostRecentTimestamp,
-                source: `Median of ${prices.length} sources`,
+                source: `Weighted average of ${prices.length} sources (outliers filtered)`,
             };
         }
         throw new Error("All NGN rate sources failed");

@@ -1,5 +1,6 @@
 import axios from "axios";
-import { calculateMedian, } from "./types";
+import { calculateMedian, filterOutliers, calculateWeightedAverage, } from "./types";
+import { withRetry } from "../../utils/retryUtil.js";
 /**
  * Circuit Breaker States
  */
@@ -80,28 +81,6 @@ class CircuitBreaker {
     }
 }
 /**
- * Retry with exponential backoff
- */
-async function withRetry(operation, config, operationName) {
-    let lastError = null;
-    for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
-        try {
-            return await operation();
-        }
-        catch (error) {
-            lastError = error instanceof Error ? error : new Error(String(error));
-            if (attempt < config.maxAttempts) {
-                const delay = Math.min(config.baseDelayMs * Math.pow(config.backoffMultiplier, attempt - 1), config.maxDelayMs);
-                console.debug(`Retry attempt ${attempt}/${config.maxAttempts} for ${operationName} ` +
-                    `after ${delay}ms delay. Error: ${lastError.message}`);
-                await new Promise((resolve) => setTimeout(resolve, delay));
-            }
-        }
-    }
-    throw (lastError ||
-        new Error(`${operationName} failed after ${config.maxAttempts} attempts`));
-}
-/**
  * Rate Source Configuration
  */
 const RATE_SOURCES = [
@@ -147,19 +126,12 @@ const APPROXIMATE_KES_USD_RATE = 130.5;
  */
 export class KESRateFetcher {
     circuitBreaker;
-    retryConfig;
     constructor() {
         this.circuitBreaker = new CircuitBreaker({
             failureThreshold: 5,
             recoveryTimeoutMs: 30000,
             halfOpenMaxAttempts: 3,
         });
-        this.retryConfig = {
-            maxAttempts: 3,
-            baseDelayMs: 500,
-            maxDelayMs: 5000,
-            backoffMultiplier: 2,
-        };
     }
     /**
      * Get the currency code this fetcher handles
@@ -175,7 +147,13 @@ export class KESRateFetcher {
         const errors = [];
         // Strategy 1: Try Binance API (with circuit breaker and retry)
         try {
-            const binanceRate = await this.circuitBreaker.execute(() => withRetry(() => this.fetchFromBinance(), this.retryConfig, "Binance API"));
+            const binanceRate = await this.circuitBreaker.execute(() => withRetry(() => this.fetchFromBinance(), {
+                maxRetries: 3,
+                retryDelay: 1000,
+                onRetry: (attempt, error, delay) => {
+                    console.debug(`Binance API retry attempt ${attempt}/3 after ${delay}ms. Error: ${error.message}`);
+                },
+            }));
             if (binanceRate) {
                 console.info(`✅ KES rate fetched from Binance: ${binanceRate.rate}`);
                 return binanceRate;
@@ -210,7 +188,13 @@ export class KESRateFetcher {
         // Strategy 3: Try alternative sources
         for (const source of RATE_SOURCES.slice(2)) {
             try {
-                const rate = await withRetry(() => this.fetchFromSource(source), this.retryConfig, source.name);
+                const rate = await withRetry(() => this.fetchFromSource(source), {
+                    maxRetries: 3,
+                    retryDelay: 1000,
+                    onRetry: (attempt, error, delay) => {
+                        console.debug(`${source.name} retry attempt ${attempt}/3 after ${delay}ms. Error: ${error.message}`);
+                    },
+                });
                 if (rate) {
                     console.info(`✅ KES rate fetched from ${source.name}: ${rate.rate}`);
                     return rate;
@@ -251,6 +235,7 @@ export class KESRateFetcher {
                     rate: directRate.rate,
                     timestamp: directRate.timestamp,
                     source: "Binance Spot (XLMKES)",
+                    trustLevel: "standard",
                 });
             }
         }
@@ -265,6 +250,7 @@ export class KESRateFetcher {
                     rate: p2pRate.rate,
                     timestamp: p2pRate.timestamp,
                     source: p2pRate.source,
+                    trustLevel: "new",
                 });
             }
         }
@@ -279,6 +265,7 @@ export class KESRateFetcher {
                     rate: xlmUsdRate.rate * APPROXIMATE_KES_USD_RATE,
                     timestamp: xlmUsdRate.timestamp,
                     source: "Binance Spot (XLMUSDT × KES/USD)",
+                    trustLevel: "new",
                 });
             }
         }
@@ -289,17 +276,23 @@ export class KESRateFetcher {
         if (prices.length === 0) {
             return null;
         }
-        // Calculate median rate from all sources
-        const rateValues = prices.map((p) => p.rate);
+        // Calculate median rate from all sources (with outlier filtering)
+        let rateValues = prices.map((p) => p.rate).filter(p => p > 0);
+        rateValues = filterOutliers(rateValues);
         const medianRate = calculateMedian(rateValues);
         // Return the median with the most recent timestamp
         const firstTimestamp = prices[0]?.timestamp ?? new Date();
         const mostRecentTimestamp = prices.reduce((latest, p) => (p.timestamp > latest ? p.timestamp : latest), firstTimestamp);
+        const weightedInput = prices.map((p) => ({
+            value: p.rate,
+            trustLevel: p.trustLevel,
+        }));
+        const weightedRate = calculateWeightedAverage(weightedInput);
         return {
             currency: "KES",
-            rate: medianRate,
+            rate: weightedRate,
             timestamp: mostRecentTimestamp,
-            source: `Binance (Median of ${prices.length} sources)`,
+            source: `Binance (Weighted average of ${prices.length} sources, outliers filtered)`,
         };
     }
     /**
@@ -307,13 +300,16 @@ export class KESRateFetcher {
      */
     async fetchBinanceSpotPrice(symbol) {
         try {
-            const response = await axios.get(BINANCE_SPOT_URL, {
+            const response = await withRetry(() => axios.get(BINANCE_SPOT_URL, {
                 params: { symbol },
                 timeout: DEFAULT_TIMEOUT_MS,
                 headers: {
                     "User-Agent": "StellarFlow-Oracle/1.0",
                     Accept: "application/json",
                 },
+            }), {
+                maxRetries: 3,
+                retryDelay: 1000,
             });
             if (response.data && response.data.lastPrice) {
                 const rate = parseFloat(response.data.lastPrice);
@@ -337,7 +333,7 @@ export class KESRateFetcher {
      */
     async fetchBinanceP2PRate() {
         try {
-            const response = await axios.post(BINANCE_P2P_URL, {
+            const response = await withRetry(() => axios.post(BINANCE_P2P_URL, {
                 fiat: "KES",
                 asset: "XLM",
                 merchantCheck: false,
@@ -351,6 +347,9 @@ export class KESRateFetcher {
                     "Content-Type": "application/json",
                     Accept: "application/json",
                 },
+            }), {
+                maxRetries: 3,
+                retryDelay: 1000,
             });
             if (response.data?.data && response.data.data.length > 0) {
                 // Calculate average price from available offers
@@ -386,12 +385,15 @@ export class KESRateFetcher {
             return null;
         }
         try {
-            const response = await axios.get(cbkSource.url, {
+            const response = await withRetry(() => axios.get(cbkSource.url, {
                 timeout: 10000,
                 headers: {
                     "User-Agent": "StellarFlow-Oracle/1.0",
                     Accept: "application/json",
                 },
+            }), {
+                maxRetries: 3,
+                retryDelay: 1000,
             });
             // CBK API returns rates in KES per USD
             const rates = response.data;
@@ -416,12 +418,15 @@ export class KESRateFetcher {
      */
     async fetchFromSource(source) {
         try {
-            const response = await axios.get(source.url, {
+            const response = await withRetry(() => axios.get(source.url, {
                 timeout: 10000,
                 headers: {
                     "User-Agent": "StellarFlow-Oracle/1.0",
                     Accept: "application/json",
                 },
+            }), {
+                maxRetries: 3,
+                retryDelay: 1000,
             });
             // Placeholder - in production, parse actual response
             // For now, return approximate rate
@@ -485,7 +490,10 @@ export class KESRateFetcher {
      */
     async isHealthy() {
         try {
-            const testRate = await withRetry(() => this.fetchFromBinance(), { ...this.retryConfig, maxAttempts: 1 }, "Health check");
+            const testRate = await withRetry(() => this.fetchFromBinance(), {
+                maxRetries: 1,
+                retryDelay: 1000,
+            });
             const healthy = testRate !== null && testRate.rate > 0;
             console.debug(`Health check result: ${healthy ? "HEALTHY" : "UNHEALTHY"}`);
             return healthy;
