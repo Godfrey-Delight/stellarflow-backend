@@ -148,9 +148,9 @@ export class PriceReviewService {
     const normalizedRate: MarketRate = {
       ...rate,
       timestamp: normalizeDateToUTC(rate.timestamp),
-      comparisonTimestamp: rate.comparisonTimestamp
-        ? normalizeDateToUTC(rate.comparisonTimestamp)
-        : undefined,
+      ...(rate.comparisonTimestamp && {
+        comparisonTimestamp: normalizeDateToUTC(rate.comparisonTimestamp),
+      }),
     };
 
     const currency = normalizedRate.currency.toUpperCase();
@@ -192,6 +192,7 @@ export class PriceReviewService {
         review_status,
         contract_status,
         reason,
+        review_reason,
         baseline_rate,
         baseline_timestamp,
         change_percent
@@ -217,6 +218,7 @@ export class PriceReviewService {
     }
 
     if (reason !== undefined) {
+    if (reviewStatus === "PENDING") {
       await webhookService.sendManualReviewNotification({
         reviewId: inserted.id,
         currency,
@@ -226,6 +228,11 @@ export class PriceReviewService {
         source: normalizedRate.source,
         timestamp: normalizedRate.timestamp,
         reason,
+        previousRate: comparisonRate!,
+        changePercent: changePercent!,
+        source: normalizedRate.source,
+        timestamp: normalizedRate.timestamp,
+        reason: reason!,
       });
     }
 
