@@ -44,12 +44,6 @@ model Currency {
   
   // Relations
   priceHistory PriceHistory[]
-}generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "postgresql"
 }
 
 model PriceRecord {
