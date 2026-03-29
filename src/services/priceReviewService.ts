@@ -196,7 +196,6 @@ export class PriceReviewService {
         fetched_at,
         review_status,
         contract_status,
-        reason,
         review_reason,
         baseline_rate,
         baseline_timestamp,
@@ -222,22 +221,16 @@ export class PriceReviewService {
       throw new Error(`Failed to create price review record for ${currency}`);
     }
 
-    if (reason !== undefined) {
-    if (reviewStatus === "PENDING") {
+    if (reviewStatus === "PENDING" && reason) {
       await webhookService.sendManualReviewNotification({
         reviewId: inserted.id,
         currency,
         rate: normalizedRate.rate,
-        previousRate: comparisonRate,
-        changePercent,
+        previousRate: comparisonRate ?? 0,
+        changePercent: changePercent ?? 0,
         source: normalizedRate.source,
         timestamp: normalizedRate.timestamp,
-        reason,
-        previousRate: comparisonRate!,
-        changePercent: changePercent!,
-        source: normalizedRate.source,
-        timestamp: normalizedRate.timestamp,
-        reason: reason!,
+        reason: reason,
       });
     }
 
@@ -323,11 +316,12 @@ updated_at = CURRENT_TIMESTAMP
 RETURNING *
   `;
 
-    if (!rows[0]) {
+    const row = rows[0];
+    if (!row) {
       throw new Error(`Pending review ${params.reviewId} was not found`);
     }
 
-    return mapReviewRow(rows[0]);
+    return mapReviewRow(row);
   }
 
   async rejectReview(params: {
@@ -351,11 +345,12 @@ reviewed_at = CURRENT_TIMESTAMP,
 RETURNING *
   `;
 
-    if (!rows[0]) {
+    const row = rows[0];
+    if (!row) {
       throw new Error(`Pending review ${params.reviewId} was not found`);
     }
 
-    return mapReviewRow(rows[0]);
+    return mapReviewRow(row);
   }
 
   private async getLatestSubmittedBaseline(
