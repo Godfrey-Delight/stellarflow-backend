@@ -11,6 +11,7 @@ import { multiSigSubmissionService } from "./services/multiSigSubmissionService"
 import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
+import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 
 // Load environment variables
 dotenv.config();
@@ -132,6 +133,10 @@ app.get(
     customSiteTitle: "StellarFlow API Documentation",
   }),
 );
+
+// Expose metrics endpoint early so it's not rate limited, but still want timing
+app.use(metricsMiddleware);
+app.get("/metrics", metricsEndpoint);
 
 // Apply Rate Limiting to all /api routes
 app.use("/api", rateLimitMiddleware);
@@ -263,6 +268,9 @@ app.get("/", (req, res) => {
         currencies: "/api/v1/market-rates/currencies",
         cache: "/api/v1/market-rates/cache",
         clearCache: "POST /api/v1/market-rates/cache/clear",
+      },
+      system: {
+        metrics: "/metrics",
       },
       stats: {
         volume: "/api/v1/stats/volume?date=YYYY-MM-DD",
