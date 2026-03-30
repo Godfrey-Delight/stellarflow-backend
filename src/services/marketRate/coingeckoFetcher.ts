@@ -1,8 +1,11 @@
 import axios from "axios";
+import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout.js";
 import { withRetry } from "../../utils/retryUtil.js";
+import { createFetcherLogger } from "../../utils/logger.js";
 
 export class CoinGeckoFetcher {
   private static readonly API_URL = "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd";
+  private static logger = createFetcherLogger("CoinGecko");
 
   /**
    * Fetches the current XLM/USD price from CoinGecko.
@@ -11,13 +14,17 @@ export class CoinGeckoFetcher {
    */
   static async fetchXlmUsdPrice(): Promise<number> {
     const response = await withRetry(
-      () => axios.get(CoinGeckoFetcher.API_URL),
+      () =>
+        axios.get(CoinGeckoFetcher.API_URL, {
+          timeout: OUTGOING_HTTP_TIMEOUT_MS,
+        }),
       {
         maxRetries: 3,
         retryDelay: 1000,
         onRetry: (attempt, error, delay) => {
-          console.debug(
-            `CoinGecko API retry attempt ${attempt}/3 after ${delay}ms. Error: ${error.message}`
+          CoinGeckoFetcher.logger.debug(
+            `API retry attempt ${attempt}/3 after ${delay}ms`,
+            { error: error.message, attempt, delay }
           );
         },
       }
@@ -28,8 +35,19 @@ export class CoinGeckoFetcher {
       response.data.stellar &&
       typeof response.data.stellar.usd === "number"
     ) {
+      CoinGeckoFetcher.logger.info(
+        `Successfully fetched XLM/USD price`,
+        { price: response.data.stellar.usd }
+      );
       return response.data.stellar.usd;
     }
-    throw new Error("Invalid response from CoinGecko API");
+    
+    const error = new Error("Invalid response from CoinGecko API");
+    CoinGeckoFetcher.logger.fetcherError(
+      error,
+      "API response validation failed",
+      { responseData: response.data }
+    );
+    throw error;
   }
 }
