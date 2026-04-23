@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { getRate, getAllRates } from "../controllers/marketRatesController";
 import { MarketRateService } from "../services/marketRate";
+import { cacheMiddleware, invalidateCache } from "../cache/CacheMiddleware";
+import { CACHE_CONFIG, CACHE_KEYS } from "../config/redis.config";
 
 const marketRateService = new MarketRateService();
 
@@ -40,7 +42,14 @@ const marketRateService = new MarketRateService();
 const router = Router();
 
 // Get rate for specific currency
-router.get("/rate/:currency", getRate);
+router.get(
+  "/rate/:currency",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: (req) => CACHE_KEYS.marketRates.single(req.params.currency),
+  }),
+  getRate,
+);
 
 /**
  * @swagger
@@ -72,7 +81,14 @@ router.get("/rate/:currency", getRate);
  *         description: Internal server error
  */
 // Get all available rates
-router.get("/rates", getAllRates);
+router.get(
+  "/rates",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.all(),
+  }),
+  getAllRates,
+);
 
 /**
  * @swagger
@@ -89,7 +105,13 @@ router.get("/rates", getAllRates);
  *         description: Internal server error
  */
 // GET /api/v1/market-rates/latest
-router.get("/latest", async (req, res) => {
+router.get(
+  "/latest",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.latest(),
+  }),
+  async (req, res) => {
   try {
     const result = await marketRateService.getLatestPrices();
 
@@ -132,7 +154,13 @@ router.get("/latest", async (req, res) => {
  *       '500':
  *         description: Internal server error
  */
-router.get("/reviews/pending", async (req, res) => {
+router.get(
+  "/reviews/pending",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.pendingReviews(),
+  }),
+  async (req, res) => {
   try {
     const reviews = await marketRateService.getPendingReviews();
 
@@ -185,7 +213,10 @@ router.get("/reviews/pending", async (req, res) => {
  *       '500':
  *         description: Internal server error
  */
-router.post("/reviews/:id/approve", async (req, res) => {
+router.post(
+  "/reviews/:id/approve",
+  invalidateCache("market-rates:*"),
+  async (req, res) => {
   try {
     const reviewId = Number.parseInt(req.params.id, 10);
     if (!Number.isFinite(reviewId)) {
@@ -252,7 +283,10 @@ router.post("/reviews/:id/approve", async (req, res) => {
  *       '500':
  *         description: Internal server error
  */
-router.post("/reviews/:id/reject", async (req, res) => {
+router.post(
+  "/reviews/:id/reject",
+  invalidateCache("market-rates:*"),
+  async (req, res) => {
   try {
     const reviewId = Number.parseInt(req.params.id, 10);
     if (!Number.isFinite(reviewId)) {
@@ -300,7 +334,13 @@ router.post("/reviews/:id/reject", async (req, res) => {
  *         description: Internal server error
  */
 // Health check for all fetchers
-router.get("/health", async (req, res) => {
+router.get(
+  "/health",
+  cacheMiddleware({
+    ttl: 60,
+    keyGenerator: () => CACHE_KEYS.marketRates.health(),
+  }),
+  async (req, res) => {
   try {
     const health = await marketRateService.healthCheck();
 
@@ -343,7 +383,13 @@ router.get("/health", async (req, res) => {
  *         description: Internal server error
  */
 // Get supported currencies
-router.get("/currencies", (req, res) => {
+router.get(
+  "/currencies",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.currencies(),
+  }),
+  (req, res) => {
   try {
     const currencies = marketRateService.getSupportedCurrencies();
 

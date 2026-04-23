@@ -12,6 +12,7 @@ import priceUpdatesRouter from "./routes/priceUpdates";
 import assetsRouter from "./routes/assets";
 import statusRouter from "./routes/status";
 import derivedAssetsRouter from "./routes/derivedAssets";
+import cacheMetricsRouter from "./cache/CacheMetrics";
 import { apiKeyMiddleware } from "./middleware/apiKeyMiddleware";
 import { rateLimitMiddleware } from "./middleware/rateLimitMiddleware";
 import { specs } from "./lib/swagger";
@@ -98,6 +99,7 @@ app.use("/api/v1/price-updates", priceUpdatesRouter);
 app.use("/api/v1/assets", assetsRouter);
 app.use("/api/v1/status", statusRouter);
 app.use("/api/v1/derived-assets", derivedAssetsRouter);
+app.use("/api/v1/cache", cacheMetricsRouter);
 
 app.get("/", (req, res) => {
   res.json({
